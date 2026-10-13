@@ -192,7 +192,7 @@ def build_estimate_pdf(estimate, rows_df, discount=0):
 
     pdf.set_x(L)
     pdf.set_font("Arial", "B", 12)
-    pdf.cell(W, 7, "FORM PENAWARAN SERVICE KENDARAAN", 0, 1, "C")
+    pdf.cell(W, 7, "FORM ESTIMASI SERVICE KENDARAAN", 0, 1, "C")
     pdf.ln(2)
 
     # ---------- DATA PELANGGAN ----------
@@ -313,6 +313,287 @@ def build_estimate_pdf(estimate, rows_df, discount=0):
     return bytes(output)
 
 
+# --- PENYIMPANAN PERMANEN ---
+# Jika DATABASE_URL diisi di .streamlit/secrets.toml -> memakai Postgres online (Supabase), data permanen.
+# Jika tidak diisi -> memakai file lokal data/cendana.db (SQLite), cocok untuk komputer sendiri.
+import sqlite3
+
+DB_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "data")
+DB_PATH = os.path.join(DB_DIR, "cendana.db")
+BULAN_ID = ["Januari", "Februari", "Maret", "April", "Mei", "Juni", "Juli", "Agustus", "September", "Oktober", "November", "Desember"]
+
+
+def _get_database_url():
+    try:
+        url = st.secrets.get("DATABASE_URL", "")
+    except Exception:
+        url = ""
+    return (url or os.environ.get("DATABASE_URL", "")).strip()
+
+
+DATABASE_URL = _get_database_url()
+USE_PG = bool(DATABASE_URL)
+DB_LABEL = "Supabase (Postgres, permanen)" if USE_PG else "SQLite lokal (data/cendana.db)"
+
+
+@st.cache_resource
+def _pg_connect(url):
+    import psycopg2
+    conn = psycopg2.connect(url, connect_timeout=15)
+    conn.autocommit = True
+    return conn
+
+
+class _Conn:
+    """Pembungkus tipis agar kode yang sama bisa jalan di SQLite maupun Postgres."""
+
+    def __init__(self):
+        if USE_PG:
+            self.raw = _pg_connect(DATABASE_URL)
+        else:
+            os.makedirs(DB_DIR, exist_ok=True)
+            self.raw = sqlite3.connect(DB_PATH)
+            self.raw.row_factory = sqlite3.Row
+
+    def _run_pg(self, sql, params):
+        import psycopg2
+        import psycopg2.extras
+        cur = self.raw.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
+        cur.execute(sql.replace("?", "%s"), [psycopg2.Binary(p) if isinstance(p, (bytes, bytearray)) else p for p in params])
+        return cur
+
+    def execute(self, sql, params=()):
+        if not USE_PG:
+            return self.raw.execute(sql, params)
+        import psycopg2
+        try:
+            return self._run_pg(sql, params)
+        except (psycopg2.OperationalError, psycopg2.InterfaceError):
+            # koneksi putus (idle terlalu lama) -> sambung ulang sekali
+            _pg_connect.clear()
+            self.raw = _pg_connect(DATABASE_URL)
+            return self._run_pg(sql, params)
+
+    def commit(self):
+        if not USE_PG:
+            self.raw.commit()
+
+    def close(self):
+        if not USE_PG:
+            self.raw.close()
+
+
+def db_conn():
+    return _Conn()
+
+
+def _b(value):
+    return bytes(value) if value is not None else None
+
+
+def init_db():
+    pk = "BIGSERIAL PRIMARY KEY" if USE_PG else "INTEGER PRIMARY KEY AUTOINCREMENT"
+    blob = "BYTEA" if USE_PG else "BLOB"
+    big = "BIGINT" if USE_PG else "INTEGER"
+    statements = [
+        f"CREATE TABLE IF NOT EXISTS deposits (id {pk}, tanggal TEXT, nominal {big}, keterangan TEXT, bank_asal TEXT, metode TEXT, bukti_nama TEXT, bukti_blob {blob}, status TEXT)",
+        f"CREATE TABLE IF NOT EXISTS expenses (id {pk}, tanggal TEXT, keterangan TEXT, kategori TEXT, nominal {big}, bukti_nama TEXT, bukti_blob {blob})",
+        f"CREATE TABLE IF NOT EXISTS payslips (id {pk}, dibuat TEXT, karyawan TEXT, status_pekerja TEXT, periode TEXT, total {big}, nama_file TEXT, pdf_blob {blob}, UNIQUE(karyawan, periode))",
+        f"CREATE TABLE IF NOT EXISTS estimates (id {pk}, dibuat TEXT, pelanggan TEXT, kendaraan TEXT, plat TEXT, tgl_estimasi TEXT, total {big}, nama_file TEXT, pdf_blob {blob}, UNIQUE(pelanggan, kendaraan, plat, tgl_estimasi, total))",
+    ]
+    conn = db_conn()
+    try:
+        for statement in statements:
+            conn.execute(statement)
+        if USE_PG:
+            # Tutup akses lewat API publik Supabase; aplikasi ini terhubung langsung sebagai pemilik tabel.
+            for table in ("deposits", "expenses", "payslips", "estimates"):
+                conn.execute(f"ALTER TABLE {table} ENABLE ROW LEVEL SECURITY")
+        conn.commit()
+    finally:
+        conn.close()
+
+
+@st.cache_resource
+def init_db_once(backend_key):
+    init_db()
+    return True
+
+
+def _now():
+    return pd.Timestamp.today().strftime("%Y-%m-%d %H:%M")
+
+
+def load_deposits():
+    conn = db_conn()
+    try:
+        rows = conn.execute("SELECT * FROM deposits ORDER BY id").fetchall()
+    finally:
+        conn.close()
+    return [{"id": r["id"], "Tanggal": r["tanggal"], "Nominal": r["nominal"], "Keterangan": r["keterangan"],
+             "Bank Asal": r["bank_asal"], "Metode": r["metode"], "Bukti": r["bukti_nama"],
+             "FileObj": _b(r["bukti_blob"]), "Status": r["status"]} for r in rows]
+
+
+def add_deposit(draft, proof_name, proof_bytes):
+    conn = db_conn()
+    try:
+        conn.execute(
+            "INSERT INTO deposits (tanggal, nominal, keterangan, bank_asal, metode, bukti_nama, bukti_blob, status) VALUES (?,?,?,?,?,?,?,?)",
+            (_now(), int(draft["Nominal"]), draft["Keterangan"], draft["Bank Asal"], draft["Metode"], proof_name, proof_bytes, "Sukses (dilaporkan)"),
+        )
+        conn.commit()
+    finally:
+        conn.close()
+
+
+def load_expenses():
+    conn = db_conn()
+    try:
+        rows = conn.execute("SELECT * FROM expenses ORDER BY id").fetchall()
+    finally:
+        conn.close()
+    return [{"id": r["id"], "Tanggal": r["tanggal"], "Keterangan": r["keterangan"], "Kategori": r["kategori"],
+             "Nominal": r["nominal"], "Bukti": r["bukti_nama"], "FileObj": _b(r["bukti_blob"])} for r in rows]
+
+
+def add_expense(desc, category, amount, proof_name, proof_bytes):
+    conn = db_conn()
+    try:
+        conn.execute(
+            "INSERT INTO expenses (tanggal, keterangan, kategori, nominal, bukti_nama, bukti_blob) VALUES (?,?,?,?,?,?)",
+            (pd.Timestamp.today().strftime("%Y-%m-%d"), desc, category, int(amount), proof_name, proof_bytes),
+        )
+        conn.commit()
+    finally:
+        conn.close()
+
+
+def update_expense(expense_id, tanggal, desc, category, amount):
+    conn = db_conn()
+    try:
+        conn.execute("UPDATE expenses SET tanggal=?, keterangan=?, kategori=?, nominal=? WHERE id=?",
+                     (tanggal, desc, category, int(amount), expense_id))
+        conn.commit()
+    finally:
+        conn.close()
+
+
+def delete_expense(expense_id):
+    conn = db_conn()
+    try:
+        conn.execute("DELETE FROM expenses WHERE id=?", (expense_id,))
+        conn.commit()
+    finally:
+        conn.close()
+
+
+def get_totals():
+    """Saldo = total setoran - total pengeluaran (selalu dihitung dari database)."""
+    conn = db_conn()
+    try:
+        dep = int(conn.execute("SELECT COALESCE(SUM(nominal), 0) AS s FROM deposits").fetchone()["s"])
+        exp = int(conn.execute("SELECT COALESCE(SUM(nominal), 0) AS s FROM expenses").fetchone()["s"])
+    finally:
+        conn.close()
+    return {"total_deposit": dep, "total_expense": exp, "balance": dep - exp}
+
+
+def save_payslip(worker, periode, total, filename, pdf_bytes):
+    conn = db_conn()
+    try:
+        conn.execute(
+            "INSERT INTO payslips (dibuat, karyawan, status_pekerja, periode, total, nama_file, pdf_blob) VALUES (?,?,?,?,?,?,?) "
+            "ON CONFLICT (karyawan, periode) DO UPDATE SET dibuat=excluded.dibuat, status_pekerja=excluded.status_pekerja, "
+            "total=excluded.total, nama_file=excluded.nama_file, pdf_blob=excluded.pdf_blob",
+            (_now(), worker["name"], worker["type"], periode, int(total), filename, pdf_bytes),
+        )
+        conn.commit()
+    finally:
+        conn.close()
+
+
+def save_estimate_history(estimate, total, filename, pdf_bytes):
+    conn = db_conn()
+    try:
+        conn.execute(
+            "INSERT INTO estimates (dibuat, pelanggan, kendaraan, plat, tgl_estimasi, total, nama_file, pdf_blob) VALUES (?,?,?,?,?,?,?,?) "
+            "ON CONFLICT (pelanggan, kendaraan, plat, tgl_estimasi, total) DO UPDATE SET dibuat=excluded.dibuat, "
+            "nama_file=excluded.nama_file, pdf_blob=excluded.pdf_blob",
+            (_now(), estimate.get("customer_name", "-"), estimate.get("vehicle", "-"), estimate.get("plate_number", "-"),
+             estimate.get("estimate_date", ""), int(total), filename, pdf_bytes),
+        )
+        conn.commit()
+    finally:
+        conn.close()
+
+
+def search_history(table, columns, query):
+    like_op = "ILIKE" if USE_PG else "LIKE"
+    conn = db_conn()
+    try:
+        if query and query.strip():
+            like = f"%{query.strip()}%"
+            where = " OR ".join(f"{c} {like_op} ?" for c in columns)
+            rows = conn.execute(f"SELECT * FROM {table} WHERE {where} ORDER BY id DESC", [like] * len(columns)).fetchall()
+        else:
+            rows = conn.execute(f"SELECT * FROM {table} ORDER BY id DESC").fetchall()
+    finally:
+        conn.close()
+    return rows
+
+
+def get_pdf(table, row_id):
+    conn = db_conn()
+    try:
+        row = conn.execute(f"SELECT nama_file, pdf_blob FROM {table} WHERE id=?", (row_id,)).fetchone()
+    finally:
+        conn.close()
+    return (row["nama_file"], _b(row["pdf_blob"])) if row else (None, None)
+
+
+def render_pdf_history(table, columns, label_fn, display_cols, prefix, title, search_hint):
+    st.subheader(title)
+    query = st.text_input(search_hint, key=f"{prefix}_search")
+    rows = search_history(table, columns, query)
+    if not rows:
+        st.caption("Belum ada riwayat dokumen." if not query else "Tidak ada dokumen yang cocok dengan pencarian.")
+        return
+    st.dataframe(pd.DataFrame([{label: r[col] for label, col in display_cols.items()} for r in rows]), use_container_width=True)
+    chosen = st.selectbox("Pilih dokumen untuk diunduh:", options=[r["id"] for r in rows],
+                          format_func=lambda i: label_fn(next(r for r in rows if r["id"] == i)), key=f"{prefix}_select")
+    file_name, pdf_bytes = get_pdf(table, chosen)
+    if pdf_bytes:
+        st.download_button("📥 Unduh PDF dari Riwayat", data=pdf_bytes, file_name=file_name, mime="application/pdf", key=f"{prefix}_dl_{chosen}")
+        with st.expander("Pratinjau PDF"):
+            b64 = base64.b64encode(pdf_bytes).decode("utf-8")
+            st.markdown(f'<iframe src="data:application/pdf;base64,{b64}" width="100%" height="600px" type="application/pdf"></iframe>', unsafe_allow_html=True)
+
+
+def render_payslip_history(prefix):
+    render_pdf_history(
+        "payslips", ["karyawan", "periode"],
+        lambda r: f"{r['karyawan']} - {r['periode']} (Rp {r['total']:,.0f})",
+        {"Disimpan": "dibuat", "Karyawan": "karyawan", "Status": "status_pekerja", "Periode": "periode", "Total (Rp)": "total"},
+        prefix, "🗂️ Riwayat Slip Gaji", "Cari nama karyawan / periode",
+    )
+
+
+def render_estimate_history(prefix):
+    render_pdf_history(
+        "estimates", ["pelanggan", "kendaraan", "plat"],
+        lambda r: f"{r['tgl_estimasi']} - {r['pelanggan']} - {r['kendaraan']} (Rp {r['total']:,.0f})",
+        {"Disimpan": "dibuat", "Pelanggan": "pelanggan", "Kendaraan": "kendaraan", "Plat": "plat", "Total (Rp)": "total"},
+        prefix, "🗂️ Riwayat PDF Estimasi Harga", "Cari nama pelanggan / kendaraan / plat",
+    )
+
+
+try:
+    init_db_once(DB_LABEL)
+except Exception as db_error:
+    st.error(f"Tidak bisa terhubung ke database ({DB_LABEL}). Periksa DATABASE_URL di secrets. Detail: {db_error}")
+    st.stop()
+
 # Konfigurasi Halaman
 st.set_page_config(
     page_title="CV Cendana Motovision - Sistem Manajemen & Gaji",
@@ -321,21 +602,14 @@ st.set_page_config(
 )
 
 # Inisialisasi Session State
-if "financial_data_reset_v1" not in st.session_state:
-    st.session_state.expenses = []
-    st.session_state.seabank_balance = 0
-    st.session_state.total_deposit = 0
-    st.session_state.financial_data_reset_v1 = True
-
 if "logged_in" not in st.session_state:
     st.session_state.logged_in = False
-if "deposits" not in st.session_state:
-    st.session_state.deposits = []
 if "deposit_draft" not in st.session_state:
     st.session_state.deposit_draft = None
 
 # --- SIDEBAR: LOGIN & NAVIGASI ROLE ---
 st.sidebar.title("Cendana Motovision")
+st.sidebar.caption(f"Database: {DB_LABEL}")
 st.sidebar.markdown("---")
 
 if not st.session_state.logged_in:
@@ -372,14 +646,14 @@ else:
         st.title("👑 Dashboard Pemilik (Owner)")
         st.markdown("Ringkasan keuangan dan aset bengkel secara real-time yang terhubung langsung dengan laporan Manajer.")
         
+        totals = get_totals()
         col1, col2, col3 = st.columns(3)
         with col1:
-            st.metric("Saldo SeaBank Bengkel", f"Rp {st.session_state.seabank_balance:,.0f}")
+            st.metric("Saldo SeaBank Bengkel", f"Rp {totals['balance']:,.0f}")
         with col2:
-            total_exp = sum(e["Nominal"] for e in st.session_state.expenses)
-            st.metric("Total Pengeluaran Bulan Ini", f"Rp {total_exp:,.0f}")
+            st.metric("Total Pengeluaran", f"Rp {totals['total_expense']:,.0f}")
         with col3:
-            st.metric("Total Akumulasi Setoran Owner", f"Rp {st.session_state.total_deposit:,.0f}")
+            st.metric("Total Akumulasi Setoran Owner", f"Rp {totals['total_deposit']:,.0f}")
         
         st.markdown("---")
         st.subheader("💰 Setor Tabungan / Modal Pemilik (Integrasi Payment SeaBank)")
@@ -405,9 +679,7 @@ else:
                         if proof is None:
                             st.error("Upload screenshot bukti transfer terlebih dahulu.")
                         else:
-                            st.session_state.deposits.append({"Tanggal": pd.Timestamp.today().strftime("%Y-%m-%d %H:%M"), **draft, "Referensi": "", "Bukti": proof.name, "FileObj": proof.getvalue(), "Status": "Sukses (dilaporkan)"})
-                            st.session_state.seabank_balance += draft["Nominal"]
-                            st.session_state.total_deposit += draft["Nominal"]
+                            add_deposit(draft, proof.name, proof.getvalue())
                             st.session_state.deposit_draft = None
                             st.success("Setoran berhasil dicatat dan saldo diperbarui.")
                             st.rerun()
@@ -417,40 +689,43 @@ else:
         if st.button("Setoran Tabungan", use_container_width=True):
             deposit_dialog()
         st.subheader("Riwayat Setoran")
-        if st.session_state.deposits:
-            st.dataframe(pd.DataFrame([{k: v for k, v in row.items() if k != "FileObj"} for row in st.session_state.deposits]), use_container_width=True)
-            for idx, row in enumerate(st.session_state.deposits):
+        deposits = load_deposits()
+        if deposits:
+            st.dataframe(pd.DataFrame([{k: v for k, v in row.items() if k not in ("FileObj", "id")} for row in deposits]), use_container_width=True)
+            for idx, row in enumerate(deposits):
                 if row.get("FileObj"):
-                    st.download_button(f"Unduh bukti setoran {idx + 1}", row["FileObj"], file_name=row["Bukti"], key=f"deposit_proof_{idx}")
+                    st.download_button(f"Unduh bukti setoran {idx + 1}", bytes(row["FileObj"]), file_name=row["Bukti"], key=f"deposit_proof_{row['id']}")
         else:
             st.caption("Belum ada riwayat setoran.")
 
         st.markdown("---")
-        if st.session_state.expenses:
-            table_data = [{k: v for k, v in item.items() if k != "FileObj"} for item in st.session_state.expenses]
+        st.subheader("Riwayat Pengeluaran")
+        owner_expenses = load_expenses()
+        if owner_expenses:
+            table_data = [{k: v for k, v in item.items() if k not in ("FileObj", "id")} for item in owner_expenses]
             df_exp = pd.DataFrame(table_data)
             st.dataframe(df_exp, use_container_width=True)
             
             st.markdown("### ðŸ” Detail & Pratinjau Bukti Nota Pengeluaran")
             selected_expense_idx = st.selectbox(
                 "Pilih Pengeluaran untuk Melihat/Mengunduh Bukti Nota:",
-                options=range(len(st.session_state.expenses)),
-                format_func=lambda i: f"{st.session_state.expenses[i]['Tanggal']} - {st.session_state.expenses[i]['Keterangan']} (Rp {st.session_state.expenses[i]['Nominal']:,.0f})"
+                options=range(len(owner_expenses)),
+                format_func=lambda i: f"{owner_expenses[i]['Tanggal']} - {owner_expenses[i]['Keterangan']} (Rp {owner_expenses[i]['Nominal']:,.0f})"
             )
             
-            chosen_exp = st.session_state.expenses[selected_expense_idx]
+            chosen_exp = owner_expenses[selected_expense_idx]
             st.write(f"**Keterangan:** {chosen_exp['Keterangan']}")
             st.write(f"**Nama File Bukti:** {chosen_exp['Bukti']}")
             
             if chosen_exp.get("FileObj") is not None:
-                file_obj = chosen_exp["FileObj"]
+                file_obj = bytes(chosen_exp["FileObj"])
                 file_ext = chosen_exp["Bukti"].split(".")[-1].lower()
 
                 @st.dialog("Bukti Pengeluaran")
                 def show_expense_proof():
                     if file_ext in ["jpg", "jpeg", "png"]:
                         st.image(file_obj, caption=chosen_exp["Bukti"], use_container_width=True)
-                    st.download_button("Unduh bukti", data=file_obj.getvalue(), file_name=chosen_exp["Bukti"], mime=f"image/{file_ext}")
+                    st.download_button("Unduh bukti", data=file_obj, file_name=chosen_exp["Bukti"], mime=f"image/{file_ext}")
 
                 if st.button("Lihat Bukti", key=f"view_expense_{selected_expense_idx}"):
                     show_expense_proof()
@@ -459,6 +734,9 @@ else:
 
         else:
             st.write("Belum ada data pengeluaran.")
+
+        st.markdown("---")
+        render_payslip_history("owner_slip")
 
         st.markdown("---")
         st.subheader("Asisten Estimasi Biaya Bengkel")
@@ -636,17 +914,24 @@ else:
                 try:
                     estimate_pdf = build_estimate_pdf(estimate, edited_estimate, discount_value)
                     safe_name = re.sub(r"[^A-Za-z0-9_-]+", "_", f"{estimate.get('customer_name', 'Pelanggan')}_{estimate.get('estimate_date', '')}").strip("_")
+                    estimate_filename = f"Penawaran_{safe_name or 'Service'}.pdf"
                     st.download_button(
                         "📥 Unduh Form Penawaran (PDF)",
                         data=estimate_pdf,
-                        file_name=f"Penawaran_{safe_name or 'Service'}.pdf",
+                        file_name=estimate_filename,
                         mime="application/pdf",
+                        on_click=save_estimate_history,
+                        args=(estimate, total_estimate - discount_value, estimate_filename, estimate_pdf),
                     )
+                    st.caption("PDF otomatis tersimpan di riwayat saat diunduh, jadi bisa dicari lagi nanti.")
                     with st.expander("Pratinjau PDF"):
                         pdf_b64 = base64.b64encode(estimate_pdf).decode("utf-8")
                         st.markdown(f'<iframe src="data:application/pdf;base64,{pdf_b64}" width="100%" height="650px" type="application/pdf"></iframe>', unsafe_allow_html=True)
                 except Exception as pdf_error:
                     st.error(f"PDF gagal dibuat: {pdf_error}")
+
+        st.markdown("---")
+        render_estimate_history("owner_est")
 
     # --- JIKA MANAJER MASUK ---
     else:
@@ -708,6 +993,8 @@ else:
                 
                 total_pay = 0
                 slip_items = []
+                _today = pd.Timestamp.today()
+                periode_slip = f"{BULAN_ID[_today.month - 1]} {_today.year}"
 
                 if d['type'] == "Karyawan Tetap":
                     base_salary = 2000000
@@ -830,7 +1117,7 @@ else:
                     pdf.cell(68, 6, f"{d['bank_name']} - {d['bank_account']}", ln=0)
                     pdf.cell(27, 6, "Periode", ln=0)
                     pdf.cell(4, 6, ":", ln=0)
-                    pdf.cell(49, 6, "Oktober 2026", ln=1)
+                    pdf.cell(49, 6, periode_slip, ln=1)
                     pdf.ln(6)
                     
                     # --- TABEL KOMPONEN GAJI ---
@@ -937,12 +1224,19 @@ else:
                 st.markdown("---")
                 
                 # Tombol Unduh Dokumen Resmi
+                slip_filename = f"Slip_Gaji_{d['name'].replace(' ', '_')}_{periode_slip.replace(' ', '_')}.pdf"
                 st.download_button(
                     label="📥 Download Dokumen Slip Gaji Resmi (PDF)",
                     data=pdf_data,
-                    file_name=f"Slip_Gaji_{d['name'].replace(' ', '_')}.pdf",
-                    mime="application/pdf"
+                    file_name=slip_filename,
+                    mime="application/pdf",
+                    on_click=save_payslip,
+                    args=(d, periode_slip, total_pay, slip_filename, pdf_data),
                 )
+                st.caption("Slip otomatis tersimpan di riwayat saat diunduh.")
+
+            st.markdown("---")
+            render_payslip_history("mgr_slip")
         with tab3:
             st.subheader("Catat Pengeluaran & Unggah Bukti Nota Bengkel")
             with st.form("expense_form"):
@@ -956,16 +1250,8 @@ else:
                 if submitted_exp:
                     if exp_amount > 0 and exp_desc:
                         file_name = uploaded_file.name if uploaded_file is not None else "Tidak ada file"
-                        
-                        st.session_state.expenses.append({
-                            "Tanggal": pd.Timestamp.today().strftime('%Y-%m-%d'),
-                            "Keterangan": exp_desc,
-                            "Kategori": exp_category,
-                            "Nominal": exp_amount,
-                            "Bukti": file_name,
-                            "FileObj": uploaded_file
-                        })
-                        st.session_state.seabank_balance -= exp_amount
+                        file_bytes = uploaded_file.getvalue() if uploaded_file is not None else None
+                        add_expense(exp_desc, exp_category, exp_amount, file_name, file_bytes)
                         
                         st.success(f"✅ Pengeluaran '{exp_desc}' senilai Rp {exp_amount:,.0f} berhasil dicatat! Data telah terkirim ke Owner dan saldo SeaBank telah dipotong.")
                     else:
@@ -973,26 +1259,27 @@ else:
 
         with tab4:
             st.subheader("Rekapitulasi Pengeluaran Bengkel")
-            if st.session_state.expenses:
-                table_data = [{k: v for k, v in item.items() if k != "FileObj"} for item in st.session_state.expenses]
+            mgr_expenses = load_expenses()
+            if mgr_expenses:
+                table_data = [{k: v for k, v in item.items() if k not in ("FileObj", "id")} for item in mgr_expenses]
                 df_all = pd.DataFrame(table_data)
                 st.dataframe(df_all, use_container_width=True)
                 
                 total_keluar = df_all["Nominal"].sum()
-                st.info(f"Total Pengeluaran Tercatat: **Rp {total_keluar:,.0f}** | Sisa Saldo SeaBank: **Rp {st.session_state.seabank_balance:,.0f}**")
+                st.info(f"Total Pengeluaran Tercatat: **Rp {total_keluar:,.0f}** | Sisa Saldo SeaBank: **Rp {get_totals()["balance"]:,.0f}**")
 
                 st.markdown("### Aksi Rekapitulasi")
                 selected_record_idx = st.selectbox(
                     "Pilih rekap yang ingin diedit atau dihapus:",
-                    options=range(len(st.session_state.expenses)),
+                    options=range(len(mgr_expenses)),
                     format_func=lambda i: (
-                        f"{st.session_state.expenses[i]['Tanggal']} - "
-                        f"{st.session_state.expenses[i]['Keterangan']} "
-                        f"(Rp {st.session_state.expenses[i]['Nominal']:,.0f})"
+                        f"{mgr_expenses[i]['Tanggal']} - "
+                        f"{mgr_expenses[i]['Keterangan']} "
+                        f"(Rp {mgr_expenses[i]['Nominal']:,.0f})"
                     ),
-                    key=f"selected_expense_action_{len(st.session_state.expenses)}",
+                    key=f"selected_expense_action_{len(mgr_expenses)}",
                 )
-                selected_record = st.session_state.expenses[selected_record_idx]
+                selected_record = mgr_expenses[selected_record_idx]
                 category_options = ["Inventaris / Part", "Operasional Bengkel", "Konsumsi"]
                 if selected_record["Kategori"] not in category_options:
                     category_options.append(selected_record["Kategori"])
@@ -1018,22 +1305,14 @@ else:
 
                 if save_expense_edit:
                     if edited_date.strip() and edited_desc.strip() and edited_amount > 0:
-                        previous_amount = selected_record["Nominal"]
-                        selected_record.update({
-                            "Tanggal": edited_date.strip(),
-                            "Keterangan": edited_desc.strip(),
-                            "Kategori": edited_category,
-                            "Nominal": edited_amount,
-                        })
-                        st.session_state.seabank_balance += previous_amount - edited_amount
+                        update_expense(selected_record["id"], edited_date.strip(), edited_desc.strip(), edited_category, edited_amount)
                         st.success("Rekap pengeluaran berhasil diperbarui.")
                         st.rerun()
                     else:
                         st.warning("Tanggal, keterangan, dan nominal wajib diisi dengan benar.")
 
                 if st.button("Hapus Rekap yang Dipilih", key=f"delete_expense_{selected_record_idx}"):
-                    deleted_record = st.session_state.expenses.pop(selected_record_idx)
-                    st.session_state.seabank_balance += deleted_record["Nominal"]
+                    delete_expense(selected_record["id"])
                     st.rerun()
             else:
                 st.write("Belum ada riwayat pengeluaran.")

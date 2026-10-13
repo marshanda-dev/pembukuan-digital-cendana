@@ -3,3 +3,4 @@ pandas
 fpdf2
 Pillow
 google-genai
+psycopg2-binary
