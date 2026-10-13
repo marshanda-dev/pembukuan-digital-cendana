@@ -706,7 +706,7 @@ else:
             df_exp = pd.DataFrame(table_data)
             st.dataframe(df_exp, use_container_width=True)
             
-            st.markdown("### ðŸ” Detail & Pratinjau Bukti Nota Pengeluaran")
+            st.markdown("Detail & Pratinjau Bukti Nota Pengeluaran")
             selected_expense_idx = st.selectbox(
                 "Pilih Pengeluaran untuk Melihat/Mengunduh Bukti Nota:",
                 options=range(len(owner_expenses)),
